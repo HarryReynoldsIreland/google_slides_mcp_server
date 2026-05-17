@@ -13,6 +13,8 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request as UrlRequest, urlopen
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -96,11 +98,19 @@ Rules:
 - Aim for 5-15 content slides depending on report length and density.
 - Return ONLY valid JSON, no commentary, no markdown fences.
 
+- For each section, optionally add an "image_query": a 2-4 word stock-photo
+  search phrase if a photo would genuinely strengthen that slide. OMIT the
+  field (or use null) for slides that are about data, summaries, conclusions,
+  or anything where a generic stock photo would feel like filler. Prefer
+  concrete, photographable subjects over abstract concepts.
+
 JSON shape:
 {
   "title": "Overall presentation title",
   "sections": [
-    {"title": "Section title", "bullets": ["Bullet 1", "Bullet 2", "Bullet 3"]}
+    {"title": "Section title", "bullets": ["Bullet 1", "Bullet 2"],
+     "image_query": "solar panels field"},
+    {"title": "Results summary", "bullets": ["Bullet 1", "Bullet 2"]}
   ]
 }
 
@@ -219,6 +229,98 @@ def _accent_bar_requests(slide_id: str, bar_id: str, theme: dict,
     ]
 
 
+def fetch_image_url(query: str) -> str | None:
+    """Best-effort Pexels landscape photo URL for a query. Never raises."""
+    key = os.environ.get("PEXELS_API_KEY")
+    if not key or not query:
+        return None
+    try:
+        params = urlencode(
+            {"query": query, "per_page": 1, "orientation": "landscape"}
+        )
+        req = UrlRequest(
+            f"https://api.pexels.com/v1/search?{params}",
+            headers={"Authorization": key},
+        )
+        with urlopen(req, timeout=10) as resp:
+            data = json.load(resp)
+        photos = data.get("photos") or []
+        if not photos:
+            return None
+        src = photos[0].get("src", {})
+        return src.get("landscape") or src.get("large")
+    except Exception:
+        return None
+
+
+def _image_requests(slide_id: str, body_id: str, image_id: str,
+                    url: str) -> list[dict]:
+    """Narrow the body to the left column and drop the photo on the right."""
+    return [
+        {
+            "updatePageElementTransform": {
+                "objectId": body_id,
+                "applyMode": "ABSOLUTE",
+                "transform": {
+                    "scaleX": 0.52,
+                    "scaleY": 1.0,
+                    "translateX": 0.46 * EMU_PER_INCH,
+                    "translateY": 1.55 * EMU_PER_INCH,
+                    "unit": "EMU",
+                },
+            }
+        },
+        {
+            "createImage": {
+                "objectId": image_id,
+                "url": url,
+                "elementProperties": {
+                    "pageObjectId": slide_id,
+                    "size": {
+                        "width": {"magnitude": 4.1 * EMU_PER_INCH, "unit": "EMU"},
+                        "height": {"magnitude": 2.15 * EMU_PER_INCH, "unit": "EMU"},
+                    },
+                    "transform": {
+                        "scaleX": 1,
+                        "scaleY": 1,
+                        "translateX": 5.4 * EMU_PER_INCH,
+                        "translateY": 2.0 * EMU_PER_INCH,
+                        "unit": "EMU",
+                    },
+                },
+            }
+        },
+    ]
+
+
+def add_images(slides_service, pres_id: str, outline: dict) -> int:
+    """Second, best-effort pass: add a photo to sections that asked for one.
+
+    Runs as its own batchUpdate so an image failure can't corrupt the deck
+    that build_presentation already created. Returns the count added.
+    """
+    requests: list[dict] = []
+    for i, section in enumerate(outline["sections"]):
+        query = section.get("image_query")
+        if not query:
+            continue
+        url = fetch_image_url(query)
+        if not url:
+            continue
+        requests.extend(
+            _image_requests(f"slide_{i}", f"body_{i}", f"image_{i}", url)
+        )
+    if not requests:
+        return 0
+    try:
+        slides_service.presentations().batchUpdate(
+            presentationId=pres_id, body={"requests": requests}
+        ).execute()
+        return sum(1 for r in requests if "createImage" in r)
+    except Exception:
+        return 0
+
+
 def build_presentation(slides_service, outline: dict,
                        theme_name: str = DEFAULT_THEME) -> str:
     pres = slides_service.presentations().create(
@@ -285,7 +387,7 @@ def build_presentation(slides_service, outline: dict,
         presentationId=pres_id, body={"requests": requests}
     ).execute()
 
-    return f"https://docs.google.com/presentation/d/{pres_id}/edit"
+    return pres_id
 
 
 mcp = FastMCP("google_slides")
@@ -293,7 +395,7 @@ mcp = FastMCP("google_slides")
 
 @mcp.tool()
 def pdf_to_slides(pdf_path: str, title: str | None = None,
-                  theme: str = DEFAULT_THEME) -> str:
+                  theme: str = DEFAULT_THEME, images: bool = True) -> str:
     """Convert a PDF report into a styled Google Slides presentation.
 
     Args:
@@ -303,6 +405,10 @@ def pdf_to_slides(pdf_path: str, title: str | None = None,
         theme: Visual theme for the deck. One of "warm" (cream/terracotta,
             default), "corporate" (white/navy/blue), "dark" (charcoal/teal),
             or "minimal" (black & white). Unknown values fall back to "warm".
+        images: If True (default), add a relevant stock photo to slides
+            where Claude judges it helpful. Requires PEXELS_API_KEY in .env;
+            if it's missing or a photo can't be found, that slide is simply
+            left text-only — the deck is still produced.
 
     Returns a message with the URL of the created presentation.
     """
@@ -331,10 +437,20 @@ def pdf_to_slides(pdf_path: str, title: str | None = None,
 
     theme_name = theme if theme in THEMES else DEFAULT_THEME
     service = get_slides_service()
-    url = build_presentation(service, outline, theme_name)
+    pres_id = build_presentation(service, outline, theme_name)
+
+    img_note = ""
+    if images:
+        if not os.environ.get("PEXELS_API_KEY"):
+            img_note = " (images skipped: PEXELS_API_KEY not set)"
+        else:
+            n = add_images(service, pres_id, outline)
+            img_note = f", {n} with photos" if n else ""
+
+    url = f"https://docs.google.com/presentation/d/{pres_id}/edit"
     return (
         f"Created '{theme_name}' presentation with "
-        f"{len(outline['sections'])} sections: {url}"
+        f"{len(outline['sections'])} sections{img_note}: {url}"
     )
 
 
